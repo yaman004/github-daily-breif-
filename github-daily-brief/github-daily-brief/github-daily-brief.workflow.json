@@ -1,0 +1,414 @@
+{
+  "name": "GitHub Daily Brief Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## GitHub Daily Brief — manual setup\n1. Create a **Telegram API** credential (BotFather token) and select it on BOTH Telegram nodes.\n2. Replace `YOUR_TELEGRAM_CHAT_ID` on BOTH Telegram nodes.\n3. Click **Execute workflow** to test (the Schedule Trigger runs hourly once the workflow is Active).\n\nNo secrets are stored in this JSON.",
+        "height": 220,
+        "width": 460
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        40
+      ],
+      "name": "Setup Notes",
+      "id": "cf7c4ea2-1145-47e6-af34-168e75513052"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "name": "Schedule Trigger",
+      "id": "0cac8867-705e-4c96-a921-be70fa3640f9"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/search/repositories",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "topic:artificial-intelligence is:public"
+            },
+            {
+              "name": "sort",
+              "value": "stars"
+            },
+            {
+              "name": "order",
+              "value": "desc"
+            },
+            {
+              "name": "per_page",
+              "value": "30"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            },
+            {
+              "name": "User-Agent",
+              "value": "n8n-github-daily-brief"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        300
+      ],
+      "name": "Search GitHub Repos",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput",
+      "id": "e8800566-0dbd-4f20-af4b-75399c782497"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Node:  Transform Repos\n// Type:  Code (JavaScript) — Mode: \"Run Once for All Items\"\n// Input: ONE item from \"Search GitHub Repos\" → { total_count, incomplete_results, items: [...] }\n// Output: ONE item → { generatedAt, topic, totalCount, topRepos: [5 cleaned repos], topRepo }\n// Errors: throws a descriptive Error; the node's \"On Error → Continue (using error output)\"\n//         setting routes it to the \"Format Error\" branch instead of failing silently.\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst TOP_N = 5;          // how many repositories to keep\nconst DESC_MAX = 200;     // max description length stored per repository\nconst TOPIC = 'artificial-intelligence'; // keep in sync with the `q` parameter of \"Search GitHub Repos\"\n\n// ── 1. Validate the API response ─────────────────────────────────────────────\nconst first = $input.first();\nconst response = first ? first.json : null;\n\nif (!response || typeof response !== 'object') {\n  throw new Error('Transform Repos received no data from \"Search GitHub Repos\".');\n}\nif (!Array.isArray(response.items)) {\n  throw new Error(\n    'GitHub search response has no \"items\" array. Received keys: [' +\n      Object.keys(response).join(', ') +\n      ']. GitHub message: ' + (response.message || 'n/a')\n  );\n}\nif (response.items.length === 0) {\n  throw new Error(\n    'GitHub search returned 0 repositories for topic \"' + TOPIC + '\". ' +\n      'Check the `q` query parameter on \"Search GitHub Repos\".'\n  );\n}\n\n// ── 2. Helpers ───────────────────────────────────────────────────────────────\nconst cleanText = (value, max) => {\n  if (value === null || value === undefined) return '';\n  let text = String(value)\n    .replace(/[\\u0000-\\u001F\\u007F]+/g, ' ') // strip control chars / newlines\n    .replace(/\\s+/g, ' ')                     // collapse whitespace\n    .trim();\n  if (max && text.length > max) {\n    text = text.slice(0, max - 1).trimEnd() + '…';\n  }\n  return text;\n};\n\n// ── 3. Clean + normalise each repository ─────────────────────────────────────\nconst repos = response.items\n  .filter((r) => r && r.full_name && r.html_url) // drop malformed entries\n  .map((r) => ({\n    name: r.name,\n    fullName: r.full_name,\n    owner: r.owner && r.owner.login ? r.owner.login : String(r.full_name).split('/')[0],\n    repo: r.name || String(r.full_name).split('/')[1],\n    description: cleanText(r.description, DESC_MAX) || 'No description provided',\n    stars: Number.isFinite(Number(r.stargazers_count)) ? Number(r.stargazers_count) : 0,\n    language: r.language || 'Not specified',\n    url: r.html_url,\n    lastPush: r.pushed_at || null,\n  }));\n\nif (repos.length === 0) {\n  throw new Error('All repositories in the GitHub response were malformed (missing full_name / html_url).');\n}\n\n// ── 4. Sort by stars (desc, stable tie-break on name) and keep the top N ─────\nrepos.sort((a, b) => b.stars - a.stars || a.fullName.localeCompare(b.fullName));\n\nconst topRepos = repos.slice(0, TOP_N).map((r, i) => ({ rank: i + 1, ...r }));\n\n// ── 5. Output a single item (keeps the rest of the flow linear) ──────────────\nreturn [\n  {\n    json: {\n      generatedAt: new Date().toISOString(),\n      topic: TOPIC,\n      totalCount: typeof response.total_count === 'number' ? response.total_count : null,\n      topRepos,\n      topRepo: topRepos[0], // highest-ranked → used by \"Fetch README\" and the IF node\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ],
+      "name": "Transform Repos",
+      "onError": "continueErrorOutput",
+      "id": "a46c9fe9-50c9-4a14-a570-7cf3f53fab13"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $json.topRepo.owner }}/{{ $json.topRepo.repo }}/readme",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            },
+            {
+              "name": "User-Agent",
+              "value": "n8n-github-daily-brief"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        300
+      ],
+      "name": "Fetch README",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "id": "c4b4a6d4-6e3d-454b-ac7b-d254c1ae1c8d"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Node:  Build Digest\n// Type:  Code (JavaScript) — Mode: \"Run Once for All Items\"\n// Input: ONE item from \"Fetch README\". That node uses \"Include Response Headers and\n//        Status\" + \"Never Error\", so the item looks like:\n//          { statusCode: 200, body: { content: '<base64>', encoding: 'base64', ... } }\n//        or, for a missing README: { statusCode: 404, body: { message: 'Not Found' } }\n//        or, for a network failure (Continue On Fail): { error: ... }\n// Output: ONE item → { topRepo, topRepos, readme: {...}, telegramText, ... }\n// The repository data itself is read from \"Transform Repos\" because the README\n// response replaces the item's JSON.\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst TELEGRAM_LIMIT = 4000;   // Telegram's hard limit is 4096 characters\nconst README_SUMMARY_MAX = 350;\n\nconst data = $('Transform Repos').first().json;\nconst res = $input.first() ? $input.first().json || {} : {};\n\n// ── 1. Work out what happened with the README request ────────────────────────\nconst readme = { available: false, status: 'unknown', httpStatus: null, summary: '', note: '' };\n\nconst errorToText = (e) => {\n  if (!e) return 'unknown error';\n  if (typeof e === 'string') return e;\n  return e.message || e.description || JSON.stringify(e).slice(0, 200);\n};\n\nconst decodeContent = (body) => {\n  if (!body || typeof body.content !== 'string') return null;\n  if (body.encoding === 'base64') {\n    return Buffer.from(body.content, 'base64').toString('utf-8');\n  }\n  return body.content;\n};\n\ntry {\n  if (res.error) {\n    // Network error / timeout after retries (Continue On Fail output)\n    readme.status = 'request_failed';\n    readme.note = 'README request failed: ' + errorToText(res.error);\n  } else if (res.statusCode !== undefined) {\n    readme.httpStatus = res.statusCode;\n    if (res.statusCode === 200) {\n      const markdown = decodeContent(res.body);\n      if (markdown && markdown.trim()) {\n        readme.available = true;\n        readme.status = 'ok';\n        readme.summary = summarizeMarkdown(markdown, README_SUMMARY_MAX);\n        if (!readme.summary) {\n          readme.note = 'README exists but no readable text could be extracted.';\n        }\n      } else {\n        readme.status = 'empty';\n        readme.note = 'README exists but is empty.';\n      }\n    } else if (res.statusCode === 404) {\n      readme.status = 'not_found';\n      readme.note = 'This repository has no README file.';\n    } else if (res.statusCode === 403 || res.statusCode === 429) {\n      readme.status = 'rate_limited';\n      readme.note = 'README unavailable: GitHub API rate limit or access restriction (HTTP ' + res.statusCode + ').';\n    } else {\n      readme.status = 'http_error';\n      readme.note = 'README unavailable: GitHub returned HTTP ' + res.statusCode + '.';\n    }\n  } else if (typeof res.content === 'string') {\n    // Defensive: response format without fullResponse\n    const markdown = decodeContent(res);\n    readme.available = !!markdown;\n    readme.status = markdown ? 'ok' : 'empty';\n    readme.summary = markdown ? summarizeMarkdown(markdown, README_SUMMARY_MAX) : '';\n  } else {\n    readme.status = 'unexpected_response';\n    readme.note = 'README response had an unexpected shape.';\n  }\n} catch (err) {\n  readme.available = false;\n  readme.status = 'parse_error';\n  readme.note = 'README could not be processed: ' + err.message;\n}\n\n// ── 2. Markdown → short plain-text summary ───────────────────────────────────\nfunction summarizeMarkdown(md, maxLen) {\n  let t = String(md).replace(/\\r\\n/g, '\\n');\n  t = t\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')            // HTML comments\n    .replace(/```[\\s\\S]*?```/g, ' ')              // fenced code blocks\n    .replace(/~~~[\\s\\S]*?~~~/g, ' ')\n    .replace(/<[^>]+>/g, ' ')                     // raw HTML tags\n    .replace(/!\\[[^\\]]*\\]\\([^)]*\\)/g, ' ')        // images / badges\n    .replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')      // [text](url) → text\n    .replace(/\\[([^\\]]+)\\]\\[[^\\]]*\\]/g, '$1');    // [text][ref] → text\n\n  const paragraphs = t\n    .split(/\\n\\s*\\n/)\n    .map((p) =>\n      p\n        .split('\\n')\n        .filter((line) => {\n          const l = line.trim();\n          return l && !/^#{1,6}\\s/.test(l) && !/^[|=\\-_*]{3,}$/.test(l) && !/^\\|/.test(l) && !/^\\[[^\\]]+\\]:\\s/.test(l);\n        })\n        .join(' ')\n        .replace(/[*_`>#]+/g, '')                 // leftover markdown markers\n        .replace(/\\s+/g, ' ')\n        .trim()\n    )\n    .filter((p) => p.length >= 40 && p.split(' ').length >= 6); // skip nav lines / one-word fragments\n\n  if (paragraphs.length === 0) return '';\n\n  let summary = paragraphs[0];\n  for (let i = 1; i < paragraphs.length && summary.length < maxLen * 0.6; i++) {\n    summary += ' ' + paragraphs[i];\n  }\n  if (summary.length > maxLen) {\n    summary = summary.slice(0, maxLen - 1);\n    summary = summary.replace(/\\s+\\S*$/, '').trimEnd() + '…'; // cut on a word boundary\n  }\n  return summary;\n}\n\n// ── 3. Build the Telegram message (parse_mode = HTML) ────────────────────────\nconst esc = (s) =>\n  String(s === null || s === undefined ? '' : s)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n\nconst fmt = (n) => Number(n).toLocaleString('en-US');\nconst clip = (s, max) => (s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s);\n\nfunction buildMessage(descMax, readmeMax) {\n  let dateLabel;\n  try {\n    dateLabel = $now.toFormat('dd LLL yyyy, HH:mm');\n  } catch (e) {\n    dateLabel = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';\n  }\n\n  const lines = [];\n  lines.push('📰 <b>GitHub Daily Brief</b>');\n  lines.push('Topic: ' + esc(data.topic) + ' · ' + esc(dateLabel));\n  lines.push('');\n  lines.push('🏆 <b>Top ' + data.topRepos.length + ' repositories by stars</b>');\n\n  for (const r of data.topRepos) {\n    lines.push('');\n    lines.push('<b>' + r.rank + '. ' + esc(r.fullName) + '</b>');\n    lines.push('⭐ ' + fmt(r.stars) + '  ·  💻 ' + esc(r.language));\n    lines.push(esc(clip(r.description, descMax)));\n    lines.push('🔗 ' + esc(r.url));\n  }\n\n  lines.push('');\n  lines.push('📖 <b>README summary — ' + esc(data.topRepo.fullName) + '</b>');\n  if (readme.available && readme.summary) {\n    lines.push(esc(clip(readme.summary, readmeMax)));\n  } else {\n    lines.push('<i>' + esc(readme.note || 'README summary not available.') + '</i>');\n  }\n  return lines.join('\\n');\n}\n\n// Try normal sizes first, then progressively shorter if Telegram's limit would be exceeded.\nlet telegramText = buildMessage(140, README_SUMMARY_MAX);\nif (telegramText.length > TELEGRAM_LIMIT) telegramText = buildMessage(80, 220);\nif (telegramText.length > TELEGRAM_LIMIT) telegramText = buildMessage(50, 120);\n\n// ── 4. Output ────────────────────────────────────────────────────────────────\nreturn [\n  {\n    json: {\n      generatedAt: data.generatedAt,\n      topic: data.topic,\n      topRepo: data.topRepo,       // IF node checks topRepo.stars\n      topRepos: data.topRepos,\n      readme,\n      telegramText,\n      telegramTextLength: telegramText.length,\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ],
+      "name": "Build Digest",
+      "onError": "continueErrorOutput",
+      "id": "393b7a7c-c817-481c-a79c-e64be279217b"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7b08bb71-9333-4e14-aeb0-24f5ed5b88e1",
+              "leftValue": "={{ $json.topRepo.stars }}",
+              "rightValue": 1000,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        300
+      ],
+      "name": "Stars > 1000?",
+      "id": "62dc3c6b-c09d-49d7-a40a-e9042ee37b39"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.telegramText }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1560,
+        200
+      ],
+      "name": "Send Daily Digest",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "id": "69a9e92d-ecf8-4a6e-a308-751a03ae1e42"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Node:  Log Fallback\n// Type:  Code (JavaScript) — Mode: \"Run Once for All Items\"\n// Runs on the FALSE branch of \"Stars > 1000?\" (top repository has 1,000 stars or fewer).\n// No Telegram notification is sent; instead a structured log entry is written to the\n// n8n server console AND returned as the node output so it is visible in the\n// execution view (useful as a screenshot for the assessment).\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst THRESHOLD = 1000; // must match the IF node's right-hand value\n\nconst input = $input.first().json;\nconst top = input.topRepo || {};\n\nconst entry = {\n  level: 'INFO',\n  event: 'digest_suppressed_below_threshold',\n  message:\n    'Top repository \"' + (top.fullName || 'unknown') + '\" has ' + (top.stars ?? 'unknown') +\n    ' stars, which is not more than ' + THRESHOLD + '. No Telegram digest was sent.',\n  threshold: THRESHOLD,\n  topRepo: {\n    fullName: top.fullName || null,\n    stars: top.stars ?? null,\n    language: top.language || null,\n    url: top.url || null,\n  },\n  readmeStatus: input.readme ? input.readme.status : 'unknown',\n  checkedAt: new Date().toISOString(),\n};\n\nconsole.log('[GitHub Daily Brief] ' + JSON.stringify(entry));\n\nreturn [{ json: entry }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        420
+      ],
+      "name": "Log Fallback",
+      "id": "13b74c91-4194-4838-a5fd-ae67d6b6fa55"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Node:  Format Error\n// Type:  Code (JavaScript) — Mode: \"Run Once for All Items\"\n// Receives items from the ERROR outputs of:\n//   • Search GitHub Repos   • Transform Repos   • Build Digest   • Send Daily Digest\n// and turns them into a clear, secret-free message for \"Send Error Alert\".\n// ─────────────────────────────────────────────────────────────────────────────\n\n// Which node did this error come from? ($prevNode is provided by n8n.)\nconst stage =\n  typeof $prevNode !== 'undefined' && $prevNode && $prevNode.name ? $prevNode.name : 'unknown node';\n\n// Never leak a Telegram bot token if it ever shows up inside an error string.\nconst redact = (s) => String(s).replace(/bot\\d{6,}:[A-Za-z0-9_-]{20,}/g, 'bot<redacted>');\n\nfunction extract(raw) {\n  const e = raw && raw.error !== undefined ? raw.error : raw;\n  if (typeof e === 'string') return { message: e };\n  if (e && typeof e === 'object') {\n    return {\n      message: e.message || e.description || 'Unknown error',\n      description: e.description && e.description !== e.message ? e.description : '',\n      status: e.httpCode || e.statusCode || e.status || (e.cause && (e.cause.status || e.cause.statusCode)) || null,\n      code: e.code || (e.cause && e.cause.code) || null,\n    };\n  }\n  return { message: 'Unknown error (no error details were provided).' };\n}\n\nfunction hint(stageName, status, message) {\n  const m = String(message).toLowerCase();\n  const st = Number(status);\n  // The Telegram nodes are named \"Send Daily Digest\" / \"Send Error Alert\" (no \"telegram\" in the name).\n  const isTelegram = /^Send (Daily Digest|Error Alert)$/.test(stageName) || /telegram|chat not found/i.test(m);\n\n  if (isTelegram) {\n    if (m.includes('chat not found')) return 'Chat ID is wrong, or you have not sent /start to the bot yet.';\n    if (st === 401 || m.includes('unauthorized')) return 'Telegram bot token is invalid or revoked. Re-create the Telegram credential in n8n.';\n    if (st === 400) return 'Telegram rejected the request (bad chat ID or message formatting).';\n    return 'Check the Telegram credential and Chat ID on the Telegram node.';\n  }\n  if (st === 429 || (st === 403 && (m.includes('rate limit') || m.includes('forbidden') || m.includes('too many')))) {\n    return 'GitHub API rate limit probably reached (unauthenticated search = 10 requests/min). Wait a minute, or add a GitHub token (see README).';\n  }\n  if (st === 401) return 'GitHub rejected the credentials. Remove or fix the Authorization header.';\n  if (st === 404) return 'GitHub endpoint or resource not found. Check the request URL.';\n  if (st === 422) return 'GitHub rejected the search query. Check the `q` parameter.';\n  if (st >= 500) return 'GitHub API is having problems. It is safe to retry later.';\n  if (/enotfound|econnrefused|econnreset|etimedout|timeout|timed out|getaddrinfo/.test(m)) {\n    return 'Network problem reaching the API (DNS / connection / timeout). Check connectivity from the n8n host.';\n  }\n  if (m.includes('returned 0 repositories') || m.includes('no \"items\"')) {\n    return 'The search query returned no usable data. Check the topic in the `q` parameter.';\n  }\n  return 'Open the failed execution in n8n and inspect the node named above.';\n}\n\nlet executionId = 'n/a';\ntry {\n  executionId = $execution.id || 'n/a';\n} catch (e) {\n  /* $execution not available — ignore */\n}\n\nconst out = $input.all().map((item) => {\n  const d = extract(item.json);\n  const status = d.status || (String(d.message).match(/\\b([45]\\d{2})\\b/) || [])[1] || null;\n  const message = redact(d.message);\n  const timestamp = new Date().toISOString();\n  const tip = hint(stage, status, message);\n\n  const lines = [\n    '⚠️ GitHub Daily Brief FAILED',\n    'Stage: ' + stage,\n    'Error: ' + message.slice(0, 600),\n  ];\n  if (status) lines.push('HTTP status: ' + status);\n  if (d.code) lines.push('Code: ' + d.code);\n  if (d.description) lines.push('Details: ' + redact(d.description).slice(0, 300));\n  lines.push('Hint: ' + tip);\n  lines.push('Execution ID: ' + executionId);\n  lines.push('Time (UTC): ' + timestamp);\n\n  const telegramText = lines.join('\\n');\n  console.error('[GitHub Daily Brief] ' + telegramText.replace(/\\n/g, ' | '));\n\n  return {\n    json: { stage, errorMessage: message, httpStatus: status, code: d.code || null, hint: tip, executionId, timestamp, telegramText },\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        640
+      ],
+      "name": "Format Error",
+      "id": "60f5b83e-c5fd-4c65-aa41-a273668a858f"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.telegramText }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1300,
+        640
+      ],
+      "name": "Send Error Alert",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      },
+      "id": "b63b4119-b88b-4f50-ac8d-c866df899613"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Search GitHub Repos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search GitHub Repos": {
+      "main": [
+        [
+          {
+            "node": "Transform Repos",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform Repos": {
+      "main": [
+        [
+          {
+            "node": "Fetch README",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch README": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Stars > 1000?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stars > 1000?": {
+      "main": [
+        [
+          {
+            "node": "Send Daily Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Daily Digest": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "pinData": {}
+}
